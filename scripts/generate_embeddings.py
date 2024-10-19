@@ -8,6 +8,7 @@ from typing import Callable, Dict, List
 from multiprocessing import Pool, cpu_count
 
 import faiss
+import requests
 from llama_index.core import Settings, SimpleDirectoryReader, VectorStoreIndex
 from llama_index.core.llms.utils import resolve_llm
 from llama_index.readers.file.flat.base import FlatReader
@@ -119,13 +120,16 @@ if __name__ == "__main__":
     vector_store = FaissVectorStore(faiss_index=faiss_index)
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
 
-    # Load documents in batches
-    document_batches = SimpleDirectoryReader(
+    # Load all documents
+    all_documents = SimpleDirectoryReader(
         args.folder,
         recursive=True,
-        file_metadata=ocp_file_metadata_func,
-        batch_size=100  # Adjust this value based on your system's capabilities
+        file_metadata=ocp_file_metadata_func
     ).load_data()
+
+    # Implement manual batching
+    batch_size = 100  # Adjust this value based on your system's capabilities
+    document_batches = [all_documents[i:i + batch_size] for i in range(0, len(all_documents), batch_size)]
 
     # Use multiprocessing to process batches
     with Pool(processes=cpu_count()) as pool:
@@ -162,7 +166,7 @@ if __name__ == "__main__":
         "embedding-dimension": embedding_dimension,
         "chunk": args.chunk,
         "overlap": args.overlap,
-        "total-embedded-files": len(document_batches)
+        "total-embedded-files": len(all_documents)
     }
 
     with open(os.path.join(PERSIST_FOLDER, "metadata.json"), "w") as file:
