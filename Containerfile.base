@@ -1,0 +1,10 @@
+ARG EMBEDDING_MODEL=sentence-transformers/all-mpnet-base-v2
+
+FROM registry.access.redhat.com/ubi9/python-311 as lightspeed-rag-builder
+ARG EMBEDDING_MODEL
+
+USER 0
+WORKDIR /workdir
+
+COPY pyproject.toml pdm.lock Makefile .
+RUN make install-tools && pdm config python.use_venv false && make pdm-lock-check install-deps
