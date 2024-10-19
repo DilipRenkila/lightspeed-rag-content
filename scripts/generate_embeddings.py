@@ -4,15 +4,13 @@ import argparse
 import json
 import os
 import time
-from typing import Callable, Dict
+from typing import Callable, Dict, List
+from multiprocessing import Pool, cpu_count
 
 import faiss
-import requests
 from llama_index.core import Settings, SimpleDirectoryReader, VectorStoreIndex
 from llama_index.core.llms.utils import resolve_llm
 from llama_index.readers.file.flat.base import FlatReader
-
-# from llama_index.core.node_parser import MarkdownNodeParser
 from llama_index.core.schema import TextNode
 from llama_index.core.storage.storage_context import StorageContext
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
@@ -23,7 +21,6 @@ OCP_DOCS_VERSION = "4.15"
 UNREACHABLE_DOCS: int = 0
 RUNBOOKS_ROOT_URL = "https://github.com/openshift/runbooks/blob/master/alerts"
 
-
 def ping_url(url: str) -> bool:
     """Check if the URL parameter is live."""
     try:
@@ -31,7 +28,6 @@ def ping_url(url: str) -> bool:
         return response.status_code == 200
     except requests.exceptions.RequestException:
         return False
-
 
 def get_file_title(file_path: str) -> str:
     """Extract title from the plaintext doc file."""
@@ -43,14 +39,8 @@ def get_file_title(file_path: str) -> str:
         pass
     return title
 
-
 def file_metadata_func(file_path: str, docs_url_func: Callable[[str], str]) -> Dict:
-    """Populate the docs_url and title metadata elements with docs URL and the page's title.
-
-    Args:
-        file_path: str: file path in str
-        docs_url_func: Callable[[str], str]: lambda for the docs_url
-    """
+    """Populate the docs_url and title metadata elements with docs URL and the page's title."""
     docs_url = docs_url_func(file_path)
     title = get_file_title(file_path)
     msg = f"file_path: {file_path}, title: {title}, docs_url: {docs_url}"
@@ -61,14 +51,9 @@ def file_metadata_func(file_path: str, docs_url_func: Callable[[str], str]) -> D
     print(msg)
     return {"docs_url": docs_url, "title": title}
 
-
 def ocp_file_metadata_func(file_path: str) -> Dict:
-    """Populate metadata for an OCP docs page.
-
-    Args:
-        file_path: str: file path in str
-    """
-    docs_url = lambda file_path: (  # noqa: E731
+    """Populate metadata for an OCP docs page."""
+    docs_url = lambda file_path: (
         OCP_DOCS_ROOT_URL
         + OCP_DOCS_VERSION
         + file_path.removeprefix(EMBEDDINGS_ROOT_DIR).removesuffix("txt")
@@ -76,65 +61,39 @@ def ocp_file_metadata_func(file_path: str) -> Dict:
     )
     return file_metadata_func(file_path, docs_url)
 
-
 def runbook_file_metadata_func(file_path: str) -> Dict:
-    """Populate metadata for a runbook page.
-
-    Args:
-        file_path: str: file path in str
-    """
-    docs_url = lambda file_path: (  # noqa: E731
+    """Populate metadata for a runbook page."""
+    docs_url = lambda file_path: (
         RUNBOOKS_ROOT_URL + file_path.removeprefix(RUNBOOKS_ROOT_DIR)
     )
     return file_metadata_func(file_path, docs_url)
 
-
 def got_whitespace(text: str) -> bool:
     """Indicate if the parameter string contains whitespace."""
-    for c in text:
-        if c.isspace():
-            return True
-    return False
+    return any(c.isspace() for c in text)
 
+def process_batch(batch: List[Dict]) -> List[TextNode]:
+    """Process a batch of documents."""
+    nodes = Settings.text_splitter.get_nodes_from_documents(batch)
+    return [node for node in nodes if isinstance(node, TextNode) and got_whitespace(node.text)]
 
 if __name__ == "__main__":
-
     start_time = time.time()
 
     parser = argparse.ArgumentParser(description="embedding cli for task execution")
     parser.add_argument("-f", "--folder", help="Plain text folder path")
     parser.add_argument("-r", "--runbooks", help="Runbooks folder path")
-    parser.add_argument(
-        "-md",
-        "--model-dir",
-        default="embeddings_model",
-        help="Directory containing the embedding model",
-    )
-    parser.add_argument(
-        "-mn",
-        "--model-name",
-        help="HF repo id of the embedding model",
-    )
-    parser.add_argument(
-        "-c", "--chunk", type=int, default=380, help="Chunk size for embedding"
-    )
-    parser.add_argument(
-        "-l", "--overlap", type=int, default=0, help="Chunk overlap for embedding"
-    )
-    parser.add_argument(
-        "-em",
-        "--exclude-metadata",
-        nargs="+",
-        default=None,
-        help="Metadata to be excluded during embedding",
-    )
+    parser.add_argument("-md", "--model-dir", default="embeddings_model", help="Directory containing the embedding model")
+    parser.add_argument("-mn", "--model-name", help="HF repo id of the embedding model")
+    parser.add_argument("-c", "--chunk", type=int, default=380, help="Chunk size for embedding")
+    parser.add_argument("-l", "--overlap", type=int, default=0, help="Chunk overlap for embedding")
+    parser.add_argument("-em", "--exclude-metadata", nargs="+", default=None, help="Metadata to be excluded during embedding")
     parser.add_argument("-o", "--output", help="Vector DB output folder")
     parser.add_argument("-i", "--index", help="Product index")
     parser.add_argument("-v", "--ocp-version", help="OCP version")
     args = parser.parse_args()
     print(f"Arguments used: {args}")
 
-    # OLS-823: sanitize directory
     PERSIST_FOLDER = os.path.normpath("/" + args.output).lstrip("/")
     if PERSIST_FOLDER == "":
         PERSIST_FOLDER = "."
@@ -160,28 +119,20 @@ if __name__ == "__main__":
     vector_store = FaissVectorStore(faiss_index=faiss_index)
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
 
-    # Load documents
-    documents = SimpleDirectoryReader(
-        args.folder, recursive=True, file_metadata=ocp_file_metadata_func
+    # Load documents in batches
+    document_batches = SimpleDirectoryReader(
+        args.folder,
+        recursive=True,
+        file_metadata=ocp_file_metadata_func,
+        batch_size=100  # Adjust this value based on your system's capabilities
     ).load_data()
 
-    # Split based on header/section
-    # md_parser = MarkdownNodeParser()
-    # documents = md_parser.get_nodes_from_documents(documents)
+    # Use multiprocessing to process batches
+    with Pool(processes=cpu_count()) as pool:
+        all_nodes = pool.map(process_batch, document_batches)
 
-    # Create chunks/nodes
-    nodes = Settings.text_splitter.get_nodes_from_documents(documents)
-
-    # Filter out invalid nodes
-    good_nodes = []
-    for node in nodes:
-        if isinstance(node, TextNode) and got_whitespace(node.text):
-            # Exclude given metadata during embedding
-            # if args.exclude_metadata is not None:
-            #     node.excluded_embed_metadata_keys.extend(args.exclude_metadata)
-            good_nodes.append(node)
-        else:
-            print("skipping node without whitespace: " + node.__repr__())
+    # Flatten the list of nodes
+    good_nodes = [node for batch in all_nodes for node in batch]
 
     runbook_documents = SimpleDirectoryReader(
         args.runbooks,
@@ -202,23 +153,21 @@ if __name__ == "__main__":
     index.set_index_id(args.index)
     index.storage_context.persist(persist_dir=PERSIST_FOLDER)
 
-    metadata: dict = {}
-    metadata["execution-time"] = time.time() - start_time
-    metadata["llm"] = "None"
-    metadata["embedding-model"] = args.model_name
-    metadata["index-id"] = args.index
-    metadata["vector-db"] = "faiss.IndexFlatIP"
-    metadata["embedding-dimension"] = embedding_dimension
-    metadata["chunk"] = args.chunk
-    metadata["overlap"] = args.overlap
-    metadata["total-embedded-files"] = len(documents)
+    metadata: dict = {
+        "execution-time": time.time() - start_time,
+        "llm": "None",
+        "embedding-model": args.model_name,
+        "index-id": args.index,
+        "vector-db": "faiss.IndexFlatIP",
+        "embedding-dimension": embedding_dimension,
+        "chunk": args.chunk,
+        "overlap": args.overlap,
+        "total-embedded-files": len(document_batches)
+    }
 
     with open(os.path.join(PERSIST_FOLDER, "metadata.json"), "w") as file:
-        file.write(json.dumps(metadata))
+        json.dump(metadata, file)
 
     if UNREACHABLE_DOCS > 0:
-        print("WARNING:\n"
-            f"There were documents with {UNREACHABLE_DOCS} unreachable URLs, "
-            "grep the log for UNREACHABLE.\n"
-            "Please update the plain text."
-        )
+        print(f"WARNING: There were documents with {UNREACHABLE_DOCS} unreachable URLs, "
+              "grep the log for UNREACHABLE. Please update the plain text.")
