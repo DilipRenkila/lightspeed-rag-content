@@ -7,19 +7,14 @@ on:
     branches: [ "main" ]
 
 jobs:
+
   build:
+
     runs-on: ubuntu-latest
 
     steps:
     - uses: actions/checkout@v4
     - name: print runner specs
       run: lscpu && free -g
-    - name: Login to DockerHub
-      uses: docker/login-action@v2
-      with:
-        username: diliprenkila
-        password: rebeldilip123
     - name: Build the Docker image
       run: docker build . --file Containerfile.base --tag docker.io/diliprenkila/lightspeed:base
-    - name: Push the Docker image
-      run: docker push docker.io/diliprenkila/lightspeed:base
